@@ -35,6 +35,6 @@ jobs:
           platforms: linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/magnitude-relay:latest
+            ghcr.io/${{ github.repository_owner | lower }}/magnitude-relay:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max   
