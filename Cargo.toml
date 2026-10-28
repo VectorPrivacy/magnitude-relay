@@ -30,7 +30,7 @@ sha2 = { version = "0.10", features = ["asm", "compress"] }
 libc = "0.2"
 # Events are read with our own nostr-parse (in place: its spans mode), and the
 # record is written from what it found.
-nostr-parse = { git = "https://github.com/VectorPrivacy/nostr-parse", tag = "v0.2.0" }
+nostr-parse = "0.3"
 # TLS and cryptography are never written in-house: rustls (ring provider, no
 # aws-lc), its tokio glue, ring for the ACME account's signatures, and the CA
 # trust store our ACME client uses. Only relay-tls depends on them at run time,

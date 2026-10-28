@@ -175,8 +175,9 @@ checksum = "a3d66662cb5ca384d4991509755ed5a42dd8e31c4282bf881938e506fc3146ec"
 
 [[package]]
 name = "nostr-parse"
-version = "0.2.0"
-source = "git+https://github.com/VectorPrivacy/nostr-parse?tag=v0.2.0#832f436c84862815ba5b01684cb3f15a769350b7"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed9a6ed965ba07815a4cf81ad651cfd1875a3b0e776b298831dc3cf061d0ea4f"
 
 [[package]]
 name = "num-bigint"
