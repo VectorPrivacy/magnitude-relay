@@ -7,6 +7,7 @@ mod config;
 mod ephemeral;
 mod export;
 mod health;
+mod heavy;
 mod import;
 mod inbound;
 mod ingest;
@@ -58,6 +59,13 @@ commands:
                        (at most 60), by address: connections, requests,
                        events, refusals, bytes out, app, and the shape of
                        the last request (kinds and counts, never keys)
+  heavy [--minutes M] [--by time|ms|events|bytes] [--limit N]
+                       what strained the running relay in the last M minutes
+                       (a ring per thread, 512 each): REQs, COUNTs and
+                       NEG-OPENs that took 25 ms or more, or sent 2000 events
+                       or 2 MB, and connections that took 2 MB/s or more out
+                       (bursts); address, app, time waiting for a worker and
+                       in all, size, and the request's shape
   delete --filter JSON [--age SECS] [--all] (--dry-run | --yes)
                        remove matching events. --dry-run prints how many would
                        go, with a few samples, and changes nothing; --yes does
@@ -279,6 +287,13 @@ fn run() -> Result<(), String> {
             let limit = value(&mut args, "--limit")?;
             no_more(&args)?;
             operator::run_top(&load()?, minutes, by, limit)
+        }
+        "heavy" => {
+            let minutes = value(&mut args, "--minutes")?;
+            let by = text(&mut args, "--by")?;
+            let limit = value(&mut args, "--limit")?;
+            no_more(&args)?;
+            operator::run_heavy(&load()?, minutes, by, limit)
         }
         "delete" => {
             let fs = filters(&mut args, "delete")?;

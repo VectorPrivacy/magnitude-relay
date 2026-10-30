@@ -2,6 +2,7 @@
 //! what goes back. No sockets here; replies are written into an [`Outbox`]
 //! (the WebSocket layer frames them in place), so all of it is testable alone.
 
+use crate::heavy::{self, HeavyLog, Path, What};
 use crate::lists::KeyList;
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
@@ -188,6 +189,35 @@ pub struct Ctx<'a> {
     pub conn: ConnId,
     /// This connection's counts, for the operator's `top`.
     pub talk: &'a Talk,
+    /// Who is asking, and this reactor's heavy requests, for the operator's `heavy`.
+    pub ip: std::net::IpAddr,
+    pub ua: &'a str,
+    pub heavy: &'a mut HeavyLog,
+}
+
+impl Ctx<'_> {
+    /// Keeps a request answered here if it was slow or big. Only the
+    /// comparison is on every request's path.
+    #[inline]
+    fn note(&mut self, what: What, path: Path, filters: &[Filter], run_us: u64, events: u64, bytes: u64) {
+        if heavy::is_heavy(run_us, events, bytes) {
+            self.keep(what, path, filters, run_us, events, bytes);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn keep(&mut self, what: What, path: Path, filters: &[Filter], run_us: u64, events: u64, bytes: u64) {
+        metrics::inc(&self.m.requests_heavy);
+        let at = heavy::now_ms();
+        let shape = Shape::of(filters);
+        self.heavy.push(heavy::Heavy { at, ip: self.ip, ua: self.ua.into(), what, path, wait_us: 0, run_us, events, bytes, shape, ongoing: false });
+    }
+
+    /// What a worker's answer must carry back to be kept (see `note`).
+    fn took(&self, filters: &[Filter]) -> (std::time::Instant, heavy::Took) {
+        (std::time::Instant::now(), heavy::Took { ip: self.ip, shape: Shape::of(filters), wait_us: 0, run_us: 0 })
+    }
 }
 
 /// COUNTs expected to walk more index keys than this (about 2.5 ms of work)
@@ -666,10 +696,12 @@ impl Session {
             }
         }
 
+        let mut path = Path::Reactor;
         if snap.req_cost(&filters, &limits, INLINE_REQ_RANGES) > INLINE_REQ_COST {
             // A worker finds and encodes the stored events; live ones wait in
             // the hold until they have gone out.
             let token = cx.held.hold(self.conn, sub_id, early.clone());
+            let (queued, took) = cx.took(&filters);
             let job = crate::ingest::ReqJob {
                 snap: snap.clone(),
                 filters: filters.clone(),
@@ -681,6 +713,8 @@ impl Session {
                 token,
                 peer: self.trusted,
                 max_outbound: cx.cfg.max_outbound,
+                queued,
+                took,
             };
             if (cx.offload)(crate::ingest::Job::Req(job)) {
                 metrics::inc(&cx.m.reqs_offloaded);
@@ -693,11 +727,14 @@ impl Session {
                 return closed(out, sub_id, "rate-limited: too many large requests in progress, try again shortly");
             }
             metrics::inc(&cx.m.reqs_inline_fallback);
+            path = Path::Fallback;
         }
 
+        let before = out.queued();
         let a = answer(&snap, &filters, &limits, sub_id, self.trusted, cx.now, cx.cfg.max_outbound, out);
         metrics::add(&cx.m.events_out, a.sent);
         if a.too_big {
+            cx.note(What::Req, path, &filters, started.elapsed().as_micros() as u64, a.sent, out.queued().saturating_sub(before) as u64);
             ReqRefused::Limits.count(cx.m, Some(cx.talk));
             cx.subs.remove(self.conn, sub_id);
             return closed_too_big(out, sub_id, cx.cfg.max_outbound);
@@ -707,12 +744,15 @@ impl Session {
             event_msg(out, sub_id, Record(rec), self.trusted);
             metrics::inc(&cx.m.events_live);
         }
-        metrics::add(&cx.m.req_micros, started.elapsed().as_micros() as u64);
+        let us = started.elapsed().as_micros() as u64;
+        metrics::add(&cx.m.req_micros, us);
+        cx.note(What::Req, path, &filters, us, a.sent + early.len() as u64, out.queued().saturating_sub(before) as u64);
     }
 
     fn on_neg_open(&mut self, sub_id: &str, filter: Filter, msg: &[u8], cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.neg_opens);
         bump(&cx.talk.negs);
+        let started = std::time::Instant::now();
         self.neg.retain(|n| &*n.sub != sub_id);
         let mut fs = [filter];
         if let Err(m) = self.check_filters(&mut fs, cx) {
@@ -756,8 +796,14 @@ impl Session {
         let session = NegSession { sub: sub_id.into(), storage: VecStorage::new(items), items: n };
         match negentropy::reconcile(&session.storage, msg, NEG_FRAME_LIMIT) {
             Ok(resp) => {
+                let before = out.queued();
                 neg_msg(out, sub_id, &resp);
                 self.neg.push(session);
+                // Records in the set are not events sent: only its time and bytes make it heavy.
+                let (us, bytes) = (started.elapsed().as_micros() as u64, out.queued().saturating_sub(before) as u64);
+                if heavy::is_heavy(us, 0, bytes) {
+                    cx.note(What::Neg, Path::Reactor, std::slice::from_ref(&f), us, n, bytes);
+                }
             }
             Err(e) => {
                 ReqRefused::Invalid.count(cx.m, Some(cx.talk));
@@ -789,9 +835,12 @@ impl Session {
             return closed(out, sub_id, &msg);
         }
         cx.store.refresh(cx.snap);
+        let started = std::time::Instant::now();
+        let mut path = Path::Reactor;
         // Exact, always: Vector sizes its syncs with it.
         if cx.snap.count_cost(&filters) > INLINE_COUNT_KEYS {
-            let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters: filters.clone(), now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string() };
+            let (queued, took) = cx.took(&filters);
+            let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters: filters.clone(), now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string(), queued, took };
             if (cx.offload)(crate::ingest::Job::Count(job)) {
                 metrics::inc(&cx.m.counts_offloaded);
                 return;
@@ -803,8 +852,10 @@ impl Session {
                 return closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");
             }
             metrics::inc(&cx.m.reqs_inline_fallback);
+            path = Path::Fallback;
         }
         count_msg(out, sub_id, cx.snap.count_all(&filters, cx.now));
+        cx.note(What::Count, path, &filters, started.elapsed().as_micros() as u64, 0, 0);
     }
 }
 

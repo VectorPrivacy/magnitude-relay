@@ -200,12 +200,13 @@ email = "you@example.com"
 | `sync <url>` | Compares with another relay over NIP-77 and copies what one side lacks |
 | `stats` / `cert` | Store statistics; the HTTPS certificate |
 | `top` | Who has used the running relay in the last hour, by address: connections, requests, refusals, bytes out, app, and what their last request asked for (kinds and counts, never keys) |
+| `heavy` | What strained the running relay lately: REQs, COUNTs and NEG-OPENs that took 25 ms or more (time waiting for a worker shown apart) or sent 2,000 events or 2 MB, and connections that took 2 MB/s or more out, with address, app and the request's shape. Held in memory, 512 per thread; the worst also go to the log, without the address |
 
 While the relay runs, `query`, `count`, `delete`, `backup` and `sync` reach it through `<data>/admin.sock`, which only the relay's user can open. Run `magnitude-relay --help` for every option.
 
 ### Watching it
 
-Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on. Refusals are counted by reason there (a kind not accepted, invalid, rate-limited, gift wraps asked for wholesale, and so on); which address did what is only for the operator, through `top`. While a bulk sync with another relay runs, the top of the dashboard says so ("JSKitty Relay is syncing with Vector Asia Relay"), and events that arrived over a sync link are charted apart from those apps sent.
+Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on. Refusals are counted by reason there (a kind not accepted, invalid, rate-limited, gift wraps asked for wholesale, and so on); which address did what is only for the operator, through `top` and `heavy`. While a bulk sync with another relay runs, the top of the dashboard says so ("JSKitty Relay is syncing with Vector Asia Relay"), and events that arrived over a sync link are charted apart from those apps sent.
 
 <p align="center">
   <img src="docs/assets/dashboard.jpg" alt="The relay's live dashboard" width="820">

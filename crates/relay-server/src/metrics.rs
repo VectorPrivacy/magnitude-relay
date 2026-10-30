@@ -112,6 +112,10 @@ counters! {
     neg_opens,
     /// Sum of REQ time to EOSE, microseconds (with reqs: the mean).
     req_micros,
+    /// REQs, COUNTs and NEG-OPENs that were slow or big (see `heavy`).
+    requests_heavy,
+    /// Runs of seconds in which one connection took a lot of bytes out.
+    bursts,
     /// Bytes written to sockets.
     bytes_out,
     /// Bytes read from sockets.

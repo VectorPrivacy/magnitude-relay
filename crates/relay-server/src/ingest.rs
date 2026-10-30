@@ -124,16 +124,23 @@ pub struct TopAsk {
     pub reply: std::sync::mpsc::Sender<crate::subs::FxMap<std::net::IpAddr, crate::talk::Agg>>,
 }
 
+/// The operator's `heavy`: each reactor's from `from` (Unix ms) on, and its bursts going on.
+pub struct HeavyAsk {
+    pub from: u64,
+    pub reply: std::sync::mpsc::Sender<Vec<crate::heavy::Heavy>>,
+}
+
 #[derive(Clone)]
 pub enum ReactorMsg {
     /// Answered by each reactor, off the hot path.
     Top(Arc<TopAsk>),
+    Heavy(Arc<HeavyAsk>),
     Live(Arc<LiveBatch>),
     Replies(Arc<Replies>),
     /// An ephemeral event: delivered live, never stored.
     Ephemeral(Arc<[u8]>),
     /// A COUNT answered by a counting worker, for one connection.
-    Count { conn: ConnId, sub: String, n: u64 },
+    Count { conn: ConnId, sub: String, n: u64, took: Box<crate::heavy::Took> },
     /// A REQ's stored events, found and encoded by a worker (see `ReqJob`).
     Req(Arc<ReqAnswer>),
 }
@@ -148,6 +155,9 @@ pub struct ReqAnswer {
     pub ends: Vec<usize>,
     /// The answer outgrew the connection's outbound limit: CLOSED, not EOSE.
     pub too_big: bool,
+    /// Events in `msgs`, and what the answer cost (see `heavy`).
+    pub sent: u64,
+    pub took: crate::heavy::Took,
 }
 
 /// A COUNT too big to run on a reactor: the snapshot it is counted on, and
@@ -159,6 +169,9 @@ pub struct CountJob {
     pub reactor: usize,
     pub conn: ConnId,
     pub sub: String,
+    /// When it was handed over, and who asked what (see `heavy`).
+    pub queued: Instant,
+    pub took: crate::heavy::Took,
 }
 
 /// A REQ too costly for a reactor (see `Session::on_req`): answered on a
@@ -175,6 +188,9 @@ pub struct ReqJob {
     /// To a trusted peer (gift wraps listed, first-hand marks).
     pub peer: bool,
     pub max_outbound: usize,
+    /// When it was handed over, and who asked what (see `heavy`).
+    pub queued: Instant,
+    pub took: crate::heavy::Took,
 }
 
 /// Work for the query workers.

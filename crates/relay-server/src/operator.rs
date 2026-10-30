@@ -170,7 +170,18 @@ pub fn run_top(cfg: &Config, minutes: Option<u64>, by: Option<String>, limit: Op
         return Err("top reports on a running relay's connections; this one is not running".into());
     };
     let req = Request { minutes, by, limit, ..Request::new(Op::Top, Vec::new()) };
-    for line in r.connect()?.top(&req).map_err(|e| e.to_string())? {
+    for line in r.connect()?.text(&req).map_err(|e| e.to_string())? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub fn run_heavy(cfg: &Config, minutes: Option<u64>, by: Option<String>, limit: Option<u64>) -> Result<(), String> {
+    let Backend::Remote(r) = Backend::open(cfg)? else {
+        return Err("heavy reports on a running relay's requests; this one is not running".into());
+    };
+    let req = Request { minutes, by, limit, ..Request::new(Op::Heavy, Vec::new()) };
+    for line in r.connect()?.text(&req).map_err(|e| e.to_string())? {
         println!("{line}");
     }
     Ok(())

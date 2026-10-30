@@ -1827,3 +1827,55 @@ async fn top_shows_each_address_and_what_it_asked_for() {
     relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `heavy` keeps a REQ that sent a lot and the burst it made, with who asked
+/// and the request's shape (never a key); /stats counts both.
+#[tokio::test]
+async fn heavy_keeps_a_big_answer_and_its_burst() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-heavy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = start_forwarded(dir.clone(), port, "");
+    let me = Signer::new(72);
+
+    // 50 events of 60 KB: 3 MB, more than a heavy answer's 2 MB, and in well
+    // under a second, more than a burst's 2 MB/s.
+    let (_, _, ws) = raw_upgrade(relay.addr, "X-Forwarded-For: 203.0.113.30\r\nUser-Agent: writer/1\r\n").await;
+    let mut writer = ws.unwrap();
+    let body = "x".repeat(60_000);
+    for i in 0..50 {
+        writer.send(json!(["EVENT", me.event(now() - i, 30078, json!([["d", format!("big{i}")]]), &body)])).await;
+        let ok = writer.next_of(&["OK"]).await;
+        assert_eq!(ok[2], true, "{ok}");
+    }
+    let (_, _, ws) = raw_upgrade(relay.addr, "X-Forwarded-For: 203.0.113.31\r\nUser-Agent: reader/3\r\n").await;
+    let mut reader = ws.unwrap();
+    reader.send(json!(["REQ", "all", {"kinds": [30078], "authors": [me.pk()], "limit": 100}])).await;
+    assert_eq!(reader.next_of(&["EOSE"]).await[0], "EOSE");
+    // Closing ends the burst, whether or not its reactor has looked yet.
+    drop(reader);
+
+    let t = Instant::now();
+    let out = loop {
+        let out = run_ok(&dir, &["heavy", "--by", "bytes"]);
+        if out.contains(" burst ") && out.contains(" REQ ") {
+            break out;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "{out}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let row = |what: &str| out.lines().find(|l| l.contains(what)).unwrap_or_else(|| panic!("no {what} in\n{out}")).to_string();
+    let (req, burst) = (row(" REQ "), row(" burst "));
+    assert!(req.contains("203.0.113.31") && req.contains(" reactor ") && req.contains("50 ev"), "{req}");
+    assert!(req.contains("reader/3") && req.contains("kinds 30078 · authors×1 · limit 100") && !req.contains(&me.pk()), "{req}");
+    assert!(burst.contains("203.0.113.31") && burst.contains("1 REQ") && burst.contains("reader/3"), "{burst}");
+    assert!(!out.contains("203.0.113.30"), "the writer took little out:\n{out}");
+    assert!(out.lines().next().unwrap().starts_with("last 60 min: 1 REQ, 0 COUNT, 0 NEG-OPEN heavy"), "{out}");
+    run_refused(&dir, &["heavy", "--by", "nope"], "--by is one of");
+
+    let st = stats(&relay).await;
+    assert_eq!((st["requests_heavy"].as_u64(), st["bursts"].as_u64()), (Some(1), Some(1)), "{st}");
+    drop(writer);
+    relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -7,6 +7,7 @@
 //! writer (see `ingest.rs`) to fan out to its own connections.
 
 use crate::config::Config;
+use crate::heavy::{self, Heavy, HeavyLog, Path, Took, What};
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, HeldReqs, Outbox, Session, SessionCfg, SigQueue};
@@ -258,6 +259,21 @@ impl Shared {
         all
     }
 
+    /// Heavy requests and bursts over the last `minutes`, from every reactor,
+    /// with the bursts going on now: the operator's `heavy`.
+    pub fn heavy(&self, minutes: u64) -> Vec<Heavy> {
+        let from = heavy::now_ms().saturating_sub(minutes * 60_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reactors = self.reactors.get().map_or(0, Vec::len);
+        self.broadcast(ReactorMsg::Heavy(Arc::new(crate::ingest::HeavyAsk { from, reply: tx })));
+        let mut all = Vec::new();
+        for _ in 0..reactors {
+            let Ok(mut part) = rx.recv_timeout(Duration::from_secs(5)) else { break };
+            all.append(&mut part);
+        }
+        all
+    }
+
     pub fn broadcast(&self, msg: ReactorMsg) {
         for tx in self.reactors.get().expect("reactors registered") {
             let _ = tx.send(msg.clone());
@@ -288,9 +304,19 @@ struct ConnOut {
     ua: Box<str>,
     started: Instant,
     talk: Talk,
+    /// Its bytes out at the reactor's last look, and a burst under way (see `heavy`).
+    burst: Cell<heavy::Burst>,
 }
 
 impl ConnOut {
+    /// The reactor's look for bursts, `us` after its last: one that ended, as a row.
+    fn look(&self, now: u64, us: u64, last: bool) -> Option<Heavy> {
+        let mut b = self.burst.get();
+        let ended = b.look(now, us, self.talk.bytes_out.get(), self.talk.reqs.get(), last);
+        self.burst.set(b);
+        ended.map(|on| heavy::burst(on, self.ip, &self.ua, self.talk.shape.get(), false))
+    }
+
     fn new(deflate: Option<Compressor>, plain: bool, peer: bool, ip: IpAddr, ua: Box<str>) -> ConnOut {
         ConnOut {
             share: plain && deflate.is_none(),
@@ -299,6 +325,7 @@ impl ConnOut {
             ua,
             started: Instant::now(),
             talk: Talk::default(),
+            burst: Cell::new(heavy::Burst::default()),
             buf: RefCell::new(Vec::new()),
             spliced: RefCell::new(Vec::new()),
             spliced_bytes: Cell::new(0),
@@ -363,6 +390,22 @@ struct Reactor {
     held: HeldReqs,
     /// Closed connections' counts by address, for the operator's `top`.
     talk: TalkLog,
+    /// Heavy requests and bursts, for the operator's `heavy`, and when this
+    /// reactor last looked for bursts.
+    heavy: HeavyLog,
+    looked: Instant,
+}
+
+impl Reactor {
+    /// Keeps a worker's request if it was slow or big (see `heavy`).
+    fn note_worker(&mut self, what: What, conn: ConnId, took: &Took, events: u64, bytes: u64, m: &metrics::Block) {
+        if heavy::is_heavy(took.wait_us + took.run_us, events, bytes) {
+            metrics::inc(&m.requests_heavy);
+            let ua: Box<str> = self.conns.get(&conn).map_or("".into(), |o| o.ua.clone());
+            let h = Heavy { at: heavy::now_ms(), ip: took.ip, ua, what, path: Path::Worker, wait_us: took.wait_us, run_us: took.run_us, events, bytes, shape: took.shape, ongoing: false };
+            self.heavy.push(h);
+        }
+    }
 }
 
 /// Frames each reply as a WebSocket text message: built in place, or, for a
@@ -516,6 +559,8 @@ pub fn run(
             pending: std::collections::VecDeque::new(),
             held: HeldReqs::default(),
             talk: TalkLog::default(),
+            heavy: HeavyLog::default(),
+            looked: Instant::now(),
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
@@ -534,7 +579,21 @@ async fn keep_fresh(st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        shared.store.refresh(&mut st.borrow_mut().snap);
+        let mut guard = st.borrow_mut();
+        let r = &mut *guard;
+        shared.store.refresh(&mut r.snap);
+        // Once a second, also: which connections are taking a lot out.
+        let us = micros(r.looked.elapsed());
+        if us >= heavy::LOOK_US {
+            r.looked = Instant::now();
+            let now = heavy::now_ms();
+            for o in r.conns.values() {
+                if let Some(h) = o.look(now, us, false) {
+                    metrics::inc(&shared.metrics.of(r.idx).bursts);
+                    r.heavy.push(h);
+                }
+            }
+        }
     }
 }
 
@@ -556,14 +615,18 @@ pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
                 };
                 let (reactor, msg) = match job {
                     crate::ingest::Job::Count(job) => {
+                        let start = Instant::now();
                         let n = job.snap.count_all(&job.filters, job.now);
-                        (job.reactor, ReactorMsg::Count { conn: job.conn, sub: job.sub, n })
+                        let took = Box::new(Took { wait_us: micros(start - job.queued), run_us: micros(start.elapsed()), ..job.took });
+                        (job.reactor, ReactorMsg::Count { conn: job.conn, sub: job.sub, n, took })
                     }
                     crate::ingest::Job::Req(job) => {
+                        let start = Instant::now();
                         let mut c = session::Collect::default();
                         let a = session::answer(&job.snap, &job.filters, &job.limits, &job.sub, job.peer, job.now, job.max_outbound, &mut c);
                         metrics::add(&shared.metrics.of(job.reactor).events_out, a.sent);
-                        let ans = crate::ingest::ReqAnswer { conn: job.conn, sub: job.sub, token: job.token, msgs: c.buf, ends: c.ends, too_big: a.too_big };
+                        let took = Took { wait_us: micros(start - job.queued), run_us: micros(start.elapsed()), ..job.took };
+                        let ans = crate::ingest::ReqAnswer { conn: job.conn, sub: job.sub, token: job.token, msgs: c.buf, ends: c.ends, too_big: a.too_big, sent: a.sent, took };
                         (job.reactor, ReactorMsg::Req(Arc::new(ans)))
                     }
                 };
@@ -577,6 +640,10 @@ pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
 
 /// Large COUNTs waiting for a worker before new ones are refused.
 const COUNT_QUEUE: usize = 64;
+
+fn micros(d: Duration) -> u64 {
+    d.as_micros().min(u128::from(u64::MAX)) as u64
+}
 
 /// Clients' ephemeral events the sync thread may be behind on before the
 /// oldest are skipped (they are live or worthless).
@@ -624,6 +691,17 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 let _ = ask.reply.send(part);
                 (&[], 0)
             }
+            ReactorMsg::Heavy(ask) => {
+                let mut part = Vec::new();
+                r.heavy.since(ask.from, &mut part);
+                for o in r.conns.values() {
+                    if let Some(on) = o.burst.get().ongoing() {
+                        part.push(heavy::burst(on, o.ip, &o.ua, o.talk.shape.get(), true));
+                    }
+                }
+                let _ = ask.reply.send(part);
+                (&[], 0)
+            }
             ReactorMsg::Live(b) => {
                 // Kept until published: a REQ answered from an older snapshot in
                 // the meantime replays it (see Session::on_req).
@@ -652,14 +730,16 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 (&[], 0)
             }
             ReactorMsg::Ephemeral(e) => (std::slice::from_ref(e), u64::MAX),
-            ReactorMsg::Count { conn, sub, n } => {
+            ReactorMsg::Count { conn, sub, n, took } => {
                 if let Some(o) = r.conns.get(conn) {
                     o.write(|w| session::count_msg(w, sub, *n));
                     o.notify.notify_one();
                 }
+                r.note_worker(What::Count, *conn, took, 0, 0, shared.metrics.of(r.idx));
                 (&[], 0)
             }
             ReactorMsg::Req(a) => {
+                r.note_worker(What::Req, a.conn, &a.took, a.sent, a.msgs.len() as u64, shared.metrics.of(r.idx));
                 // Unless the subscription was closed or replaced meanwhile: its
                 // stored events, EOSE, then what came live while it was held.
                 if let (Some(h), Some(o)) = (r.held.take(a.conn, &a.sub, a.token), r.conns.get(&a.conn)) {
@@ -788,6 +868,10 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
         r.subs.remove_conn(conn);
         r.held.release_conn(conn);
         r.conns.remove(&conn);
+        if let Some(h) = out.look(heavy::now_ms(), micros(r.looked.elapsed()), true) {
+            metrics::inc(&shared.metrics.of(r.idx).bursts);
+            r.heavy.push(h);
+        }
         r.talk.fold(crate::ingest::now(), ip, &out.ua, &out.talk, out.started.elapsed().as_secs());
     }
     shared.release(ip);
@@ -972,6 +1056,9 @@ fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out
         held: &mut r.held,
         conn,
         talk: &out.talk,
+        ip: out.ip,
+        ua: &out.ua,
+        heavy: &mut r.heavy,
     };
     out.write(|w| f(&mut cx, w));
 }

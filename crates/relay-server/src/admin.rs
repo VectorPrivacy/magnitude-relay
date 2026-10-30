@@ -25,6 +25,8 @@
 //!     {"verdicts":["stored","refused blocked: ...",...]}, one per event
 //! {"op":"top","filters":[],"minutes":M,"by":"bytes","limit":N}
 //!     {"text":"..."} per line of the table (see `talk`), then {"done":true,"count":N}
+//! {"op":"heavy","filters":[],"minutes":M,"by":"time","limit":N}
+//!     the same, for slow and big requests and bursts (see `heavy`)
 //! ```
 //!
 //! `items` is a negentropy set and `ingest` stores events another relay sent:
@@ -82,10 +84,11 @@ pub enum Op {
     Items,
     Ingest,
     Top,
+    Heavy,
 }
 
 impl Op {
-    const NAMES: [(Op, &'static str); 7] = [
+    const NAMES: [(Op, &'static str); 8] = [
         (Op::Query, "query"),
         (Op::Count, "count"),
         (Op::Delete, "delete"),
@@ -93,6 +96,7 @@ impl Op {
         (Op::Items, "items"),
         (Op::Ingest, "ingest"),
         (Op::Top, "top"),
+        (Op::Heavy, "heavy"),
     ];
 
     fn name(self) -> &'static str {
@@ -122,7 +126,7 @@ pub struct Request {
     /// ingest: indices into `events` whose signatures a trusted peer vouched
     /// for (it took them from a client itself): not checked again.
     pub trusted: Vec<u64>,
-    /// top: the last this many minutes, sorted by this (see `talk::By`).
+    /// top, heavy: the last this many minutes, sorted by this (see `talk::By`, `heavy::By`).
     pub minutes: Option<u64>,
     pub by: Option<String>,
 }
@@ -299,9 +303,12 @@ pub struct Ctx {
     pub policy: Arc<SessionCfg>,
     /// Asks the reactors who has been using the relay (`Shared::top`).
     pub top: Option<TopFn>,
+    /// Asks the reactors what strained them (`Shared::heavy`).
+    pub heavy: Option<HeavyFn>,
 }
 
 pub type TopFn = Arc<dyn Fn(u64) -> crate::subs::FxMap<std::net::IpAddr, crate::talk::Agg> + Send + Sync>;
+pub type HeavyFn = Arc<dyn Fn(u64) -> Vec<crate::heavy::Heavy> + Send + Sync>;
 
 /// Starts listening on `<data>/admin.sock`.
 pub fn start(data: &Path, cx: Ctx) -> io::Result<Admin> {
@@ -432,6 +439,9 @@ fn handle(line: &str, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
     if req.op == Op::Top {
         return top(&req, out, cx);
     }
+    if req.op == Op::Heavy {
+        return heavy(&req, out, cx);
+    }
     operator::check_filters(&req.filters)?;
     let now = ingest::now();
     match req.op {
@@ -469,7 +479,7 @@ fn handle(line: &str, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
             writeln!(out, "{{\"count\":{n}}}").map_err(|e| e.to_string())
         }
         Op::Delete => delete(&req, out, store, ctl, now),
-        Op::Backup | Op::Top => unreachable!("answered above"),
+        Op::Backup | Op::Top | Op::Heavy => unreachable!("answered above"),
     }
 }
 
@@ -485,8 +495,27 @@ fn top(req: &Request, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
         })?,
     };
     let lines = crate::talk::render(ask(minutes), minutes, by, req.limit.unwrap_or(25) as usize);
+    text(&lines, out)
+}
+
+/// What strained the relay lately, as the lines of a table.
+fn heavy(req: &Request, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
+    let Some(ask) = &cx.heavy else { return Err("heavy reports on requests, which only the running relay has".into()) };
+    let minutes = req.minutes.unwrap_or(60).clamp(1, 24 * 60);
+    let by = match &req.by {
+        None => crate::heavy::By::Time,
+        Some(b) => crate::heavy::By::parse(b).ok_or_else(|| {
+            let names: Vec<&str> = crate::heavy::By::NAMES.iter().map(|(_, n)| *n).collect();
+            format!("--by is one of {}, not {b:?}", names.join(", "))
+        })?,
+    };
+    text(&crate::heavy::render(ask(minutes), minutes, by, req.limit.unwrap_or(25) as usize), out)
+}
+
+/// A table's lines as `{"text":..}` replies, then `{"done":..}`.
+fn text(lines: &[String], out: &mut impl Write) -> Result<(), String> {
     let mut b = Vec::new();
-    for line in &lines {
+    for line in lines {
         b.clear();
         b.extend_from_slice(b"{\"text\":\"");
         json::escape_str(line, &mut b);
@@ -800,8 +829,8 @@ impl Client {
         }
     }
 
-    /// What became of each event, in order.
-    pub fn top(self, req: &Request) -> io::Result<Vec<String>> {
+    /// A table's lines (`top`, `heavy`).
+    pub fn text(self, req: &Request) -> io::Result<Vec<String>> {
         let mut r = self.ask(req)?;
         let mut line = String::new();
         let mut lines = Vec::new();
