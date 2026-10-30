@@ -12,7 +12,7 @@ use secp256k1::{schnorr, Keypair};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -113,8 +113,13 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// A port nothing listens on, found by a socket that never listens (see
+/// `free_port` in e2e.rs).
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.set_reuseaddr(true).unwrap();
+    s.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    s.local_addr().unwrap().port()
 }
 
 fn tmp(tag: &str) -> PathBuf {

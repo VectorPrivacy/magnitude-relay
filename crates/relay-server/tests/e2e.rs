@@ -5,7 +5,7 @@ use relay_proto::hex;
 use secp256k1::{schnorr, Keypair};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -79,8 +79,16 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// A port nothing listens on. The socket that finds it is bound and never
+/// listening: a child that another test's thread spawns meanwhile holds a copy
+/// of it until its exec (Linux), and a listening copy took the readiness probe
+/// and the first client_connect, then reset them when it closed. SO_REUSEADDR
+/// lets the relay bind while such a copy is still open.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.set_reuseaddr(true).unwrap();
+    s.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    s.local_addr().unwrap().port()
 }
 
 struct Signer(Keypair);

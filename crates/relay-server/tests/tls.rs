@@ -24,8 +24,13 @@ use tokio_rustls::TlsConnector;
 
 const DAY: i64 = 86_400;
 
+/// A port nothing listens on, found by a socket that never listens (see
+/// `free_port` in e2e.rs).
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.set_reuseaddr(true).unwrap();
+    s.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    s.local_addr().unwrap().port()
 }
 
 struct Relay {
