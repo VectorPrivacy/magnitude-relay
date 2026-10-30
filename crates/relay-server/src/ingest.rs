@@ -143,6 +143,9 @@ pub enum ReactorMsg {
     Count { conn: ConnId, sub: String, n: u64, took: Box<crate::heavy::Took> },
     /// A REQ's stored events, found and encoded by a worker (see `ReqJob`).
     Req(Arc<ReqAnswer>),
+    /// A NEG-OPEN's first answer, and the set built for it (see `NegJob`).
+    /// The only reference: the reactor takes the set out of it.
+    Neg(Arc<NegAnswer>),
 }
 
 /// What a worker found for a REQ: its `["EVENT",...]` messages end to end.
@@ -193,10 +196,46 @@ pub struct ReqJob {
     pub took: crate::heavy::Took,
 }
 
+/// What a worker made of a NEG-OPEN: its first message, and the set for the
+/// connection's later NEG-MSGs.
+pub struct NegAnswer {
+    pub conn: ConnId,
+    pub sub: String,
+    /// The hold this answer is for (a NEG-CLOSE or a new NEG-OPEN with the same id ends it).
+    pub token: u64,
+    /// `["NEG-MSG",...]` or `["NEG-ERR",...]`.
+    pub msg: Vec<u8>,
+    pub opened: crate::session::NegOpened,
+    pub took: crate::heavy::Took,
+}
+
+/// A NEG-OPEN whose set is too large to build on a reactor (see
+/// `Session::on_neg_open`): built and reconciled on a worker from the
+/// snapshot it was made on, while its id is held.
+pub struct NegJob {
+    pub snap: Arc<relay_store::Version>,
+    /// `limit` already dropped.
+    pub filter: relay_proto::Filter,
+    /// Events expiring before this are left out.
+    pub horizon: u64,
+    /// The client's first message.
+    pub msg: Vec<u8>,
+    pub reactor: usize,
+    pub conn: ConnId,
+    pub sub: String,
+    pub token: u64,
+    /// To a trusted peer (gift wraps listed).
+    pub peer: bool,
+    /// When it was handed over, and who asked what (see `heavy`).
+    pub queued: Instant,
+    pub took: crate::heavy::Took,
+}
+
 /// Work for the query workers.
 pub enum Job {
     Count(CountJob),
     Req(ReqJob),
+    Neg(NegJob),
 }
 
 pub type Sink = Box<dyn Fn(ReactorMsg) + Send>;

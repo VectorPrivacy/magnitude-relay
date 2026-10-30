@@ -1879,3 +1879,138 @@ async fn heavy_keeps_a_big_answer_and_its_burst() {
     relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Reconciles the set `held` against what the relay holds for `filter`, as
+/// Vector's client does. The ids only the client has, those only the relay
+/// has, and any message for another id that came meanwhile.
+async fn reconcile<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>, sub: &str, filter: &Value, held: &[(u64, [u8; 32])]) -> (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<Value>) {
+    use negentropy::{Id, Negentropy, NegentropyStorageVector};
+    let mut st = NegentropyStorageVector::with_capacity(held.len());
+    for (t, id) in held {
+        st.insert(*t, Id::from_byte_array(*id)).unwrap();
+    }
+    st.seal().unwrap();
+    let mut neg = Negentropy::owned(st, 60_000).unwrap();
+    let init = neg.initiate().unwrap();
+    send(c, json!(["NEG-OPEN", sub, filter, hex::encode_string(&init)])).await;
+    let (mut have, mut need, mut others) = (Vec::new(), Vec::new(), Vec::new());
+    loop {
+        let m = recv(c).await;
+        if m[1] != sub {
+            others.push(m);
+            continue;
+        }
+        assert_eq!(m[0], "NEG-MSG", "{m}");
+        let bytes = hex::decode_any_case(m[2].as_str().unwrap().as_bytes()).unwrap();
+        match neg.reconcile_with_ids(&bytes, &mut have, &mut need).unwrap() {
+            Some(next) => send(c, json!(["NEG-MSG", sub, hex::encode_string(&next)])).await,
+            None => break,
+        }
+    }
+    send(c, json!(["NEG-CLOSE", sub])).await;
+    let ids = |v: Vec<negentropy::Id>| {
+        let mut v: Vec<[u8; 32]> = v.iter().map(|i| *i.as_bytes()).collect();
+        v.sort_unstable();
+        v
+    };
+    (ids(have), ids(need), others)
+}
+
+/// A trusted peer's pass reconciles windows of 100 000 to 500 000 records,
+/// which held every other connection on a reactor while the set was built.
+/// Sets that size are built by the query workers and reconcile exactly; one
+/// closed, or written to, before its answer comes gets no answer; and every
+/// set's records go back to the budget.
+#[tokio::test]
+async fn peer_sized_reconciles_are_built_off_the_reactors() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-neg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let secret = "e2e-peer-secret-0123456789abcdef";
+    let sections = format!("[policy]\nkinds = \"all\"\n[[peer]]\nname = \"twin\"\nsecret = \"{secret}\"\nips = [\"127.0.0.1\"]\n");
+    relay_stop_quietly(start_forwarded(dir.clone(), port, &sections));
+    // 160 000 events, one a second, every tenth a gift wrap: loaded unsigned.
+    const T: u64 = 1_700_000_000;
+    let id = |b: u8, n: u64| {
+        let mut v = [b; 32];
+        v[..8].copy_from_slice(&n.to_le_bytes());
+        v
+    };
+    let to = hex::encode_string(&id(0xB1, 0));
+    let mut lines = String::new();
+    for n in 0..160_000u64 {
+        let (kind, tags) = if n % 10 == 0 { (1059, format!(r#"[["p","{to}"]]"#)) } else { (1, "[]".to_string()) };
+        lines.push_str(&format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":{},"kind":{kind},"tags":{tags},"content":"n","sig":"{}"}}"#,
+            hex::encode_string(&id(0xEE, n)),
+            hex::encode_string(&id(0xC0, n % 500)),
+            T + n,
+            "00".repeat(64)
+        ));
+        lines.push('\n');
+    }
+    let file = dir.join("events.jsonl");
+    std::fs::write(&file, lines).unwrap();
+    run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
+    let relay = start_forwarded(dir.clone(), port, &sections);
+    let host = relay.addr.to_string();
+
+    // A window as a peer's pass asks for it: 150 000 records, 15 000 of them wraps.
+    let window = json!({"since": T + 5_000, "until": T + 154_999});
+    let in_window = (5_000..155_000u64).map(|n| (n, (T + n, id(0xEE, n))));
+    let first = {
+        use negentropy::{Negentropy, NegentropyStorageVector};
+        let mut st = NegentropyStorageVector::new();
+        st.seal().unwrap();
+        hex::encode_string(&Negentropy::owned(st, 60_000).unwrap().initiate().unwrap())
+    };
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    // Closed before the answer; written to before the answer: neither is answered later.
+    send(&mut c, json!(["NEG-OPEN", "x", window, first])).await;
+    send(&mut c, json!(["NEG-CLOSE", "x"])).await;
+    send(&mut c, json!(["NEG-OPEN", "z", window, first])).await;
+    send(&mut c, json!(["NEG-MSG", "z", first])).await;
+    assert_eq!(recv(&mut c).await, json!(["NEG-ERR", "z", "closed: NEG-MSG before the answer to its NEG-OPEN"]));
+    // A mailbox is answered on the spot, ahead of the big ones.
+    send(&mut c, json!(["NEG-OPEN", "small", {"kinds": [1059], "#p": [to], "until": T + 9_999}, first])).await;
+    let m = recv(&mut c).await;
+    assert_eq!((m[0].as_str(), m[1].as_str()), (Some("NEG-MSG"), Some("small")), "{m}");
+    send(&mut c, json!(["NEG-CLOSE", "small"])).await;
+    // A client's broad window leaves the wraps out, built on a worker as on a reactor.
+    let plain: Vec<(u64, [u8; 32])> = in_window.clone().filter(|(n, _)| n % 10 != 0).map(|(_, item)| item).collect();
+    let (have, need, others) = reconcile(&mut c, "plain", &window, &plain).await;
+    assert_eq!((have.len(), need.len()), (0, 0));
+    assert!(others.is_empty(), "nothing for x or z: {others:?}");
+
+    // The peer holds 90% of the window and five records the relay has not seen.
+    let mut p = client_connect(relay.addr, &host, &format!("/peer/{secret}")).await.unwrap();
+    let mut held: Vec<(u64, [u8; 32])> = in_window.clone().filter(|(n, _)| n % 10 != 3).map(|(_, item)| item).collect();
+    let extra: Vec<[u8; 32]> = (0..5).map(|n| id(0xAB, n)).collect();
+    held.extend(extra.iter().enumerate().map(|(i, x)| (T + 6_000 + i as u64, *x)));
+    let (have, need, _) = reconcile(&mut p, "pass", &window, &held).await;
+    let mut missing: Vec<[u8; 32]> = in_window.filter(|(n, _)| n % 10 == 3).map(|(_, (_, x))| x).collect();
+    missing.sort_unstable();
+    assert_eq!(have, extra);
+    assert_eq!(need.len(), 15_000);
+    assert!(need == missing, "exactly the records the peer lacks");
+
+    // Each was kept as a worker's: its wait and run apart, its records, its shape.
+    let out = run_ok(&dir, &["heavy", "--by", "events"]);
+    let row = out.lines().find(|l| l.contains("150000 rec")).unwrap_or_else(|| panic!("no peer pass in\n{out}"));
+    assert!(row.contains(" NEG-OPEN ") && row.contains(" worker ") && row.contains("any kind · since · until"), "{row}");
+    assert!(out.lines().any(|l| l.contains("135000 rec") && l.contains(" worker ")), "{out}");
+
+    let t = Instant::now();
+    loop {
+        let st = stats(&relay).await;
+        assert_eq!(st["negs_offloaded"].as_u64(), Some(4), "x, z, plain and the pass; not the mailbox: {st}");
+        if st["neg_items_held"] == 0 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "every set gives its records back: {st}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop((c, p));
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

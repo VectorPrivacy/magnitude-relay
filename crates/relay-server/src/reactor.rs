@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::heavy::{self, Heavy, HeavyLog, Path, Took, What};
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
-use crate::session::{self, Ctx, HeldReqs, Outbox, Session, SessionCfg, SigQueue};
+use crate::session::{self, Ctx, HeldNegs, HeldReqs, Outbox, Session, SessionCfg, SigQueue};
 use crate::sock::{Incoming, Sock, Stream, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use crate::talk::{self, Agg, Talk, TalkLog};
@@ -388,6 +388,8 @@ struct Reactor {
     pending: std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
     /// Subscriptions waiting for a worker's answer to their REQ.
     held: HeldReqs,
+    /// NEG-OPENs waiting for a worker, and the sets built for them.
+    negs: HeldNegs,
     /// Closed connections' counts by address, for the operator's `top`.
     talk: TalkLog,
     /// Heavy requests and bursts, for the operator's `heavy`, and when this
@@ -399,12 +401,33 @@ struct Reactor {
 impl Reactor {
     /// Keeps a worker's request if it was slow or big (see `heavy`).
     fn note_worker(&mut self, what: What, conn: ConnId, took: &Took, events: u64, bytes: u64, m: &metrics::Block) {
-        if heavy::is_heavy(took.wait_us + took.run_us, events, bytes) {
+        // Records in a NEG-OPEN's set are not events sent: only its time and bytes make it heavy.
+        let sent = if what == What::Neg { 0 } else { events };
+        if heavy::is_heavy(took.wait_us + took.run_us, sent, bytes) {
             metrics::inc(&m.requests_heavy);
             let ua: Box<str> = self.conns.get(&conn).map_or("".into(), |o| o.ua.clone());
             let h = Heavy { at: heavy::now_ms(), ip: took.ip, ua, what, path: Path::Worker, wait_us: took.wait_us, run_us: took.run_us, events, bytes, shape: took.shape, ongoing: false };
             self.heavy.push(h);
         }
+    }
+
+    /// A worker's NEG-OPEN: its answer goes out and its set waits for the
+    /// connection, unless the id was closed or opened again meanwhile.
+    fn neg_answer(&mut self, a: crate::ingest::NegAnswer, m: &metrics::Block) {
+        self.note_worker(What::Neg, a.conn, &a.took, a.opened.items, a.msg.len() as u64, m);
+        let Some(o) = self.conns.get(&a.conn) else { return };
+        let (set, refused) = match a.opened.session {
+            Ok(s) => (Some(s), None),
+            Err(why) => (None, Some(why)),
+        };
+        if !self.negs.settle(a.conn, &a.sub, a.token, set) {
+            return;
+        }
+        if let Some(why) = refused {
+            why.count(m, Some(&o.talk));
+        }
+        o.write(|w| w.text(&mut |b| b.extend_from_slice(&a.msg)));
+        o.notify.notify_one();
     }
 }
 
@@ -558,6 +581,7 @@ pub fn run(
             scratch: vec![0; READ_CHUNK],
             pending: std::collections::VecDeque::new(),
             held: HeldReqs::default(),
+            negs: HeldNegs::default(),
             talk: TalkLog::default(),
             heavy: HeavyLog::default(),
             looked: Instant::now(),
@@ -597,8 +621,9 @@ async fn keep_fresh(st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     }
 }
 
-/// COUNTs and REQs too big for a reactor, run on their own threads against the
-/// snapshot the request saw; each answer goes back to the connection's reactor.
+/// COUNTs, REQs and NEG-OPENs too big for a reactor, run on their own threads
+/// against the snapshot the request saw; each answer goes back to the
+/// connection's reactor.
 /// The queue is bounded: when it is full, a big request is refused, not queued.
 pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<crate::ingest::Job>(COUNT_QUEUE);
@@ -628,6 +653,14 @@ pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
                         let took = Took { wait_us: micros(start - job.queued), run_us: micros(start.elapsed()), ..job.took };
                         let ans = crate::ingest::ReqAnswer { conn: job.conn, sub: job.sub, token: job.token, msgs: c.buf, ends: c.ends, too_big: a.too_big, sent: a.sent, took };
                         (job.reactor, ReactorMsg::Req(Arc::new(ans)))
+                    }
+                    crate::ingest::Job::Neg(job) => {
+                        let start = Instant::now();
+                        let mut c = session::Collect::default();
+                        let opened = session::neg_open(&job.snap, &job.filter, job.horizon, job.peer, &job.sub, &job.msg, &mut c);
+                        let took = Took { wait_us: micros(start - job.queued), run_us: micros(start.elapsed()), ..job.took };
+                        let ans = crate::ingest::NegAnswer { conn: job.conn, sub: job.sub, token: job.token, msg: c.buf, opened, took };
+                        (job.reactor, ReactorMsg::Neg(Arc::new(ans)))
                     }
                 };
                 if let Some(r) = shared.reactors.get().and_then(|r| r.get(reactor)) {
@@ -681,6 +714,16 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 d_last = std::time::Instant::now();
             }
         }
+        // Taken whole: its set moves on to the connection.
+        let msg = match msg {
+            ReactorMsg::Neg(a) => {
+                if let Some(a) = Arc::into_inner(a) {
+                    r.neg_answer(a, shared.metrics.of(r.idx));
+                }
+                continue;
+            }
+            msg => msg,
+        };
         let (events, gen): (&[Arc<[u8]>], u64) = match &msg {
             ReactorMsg::Top(ask) => {
                 let mut part = FxMap::default();
@@ -730,6 +773,8 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 (&[], 0)
             }
             ReactorMsg::Ephemeral(e) => (std::slice::from_ref(e), u64::MAX),
+            // Taken whole above.
+            ReactorMsg::Neg(_) => (&[], 0),
             ReactorMsg::Count { conn, sub, n, took } => {
                 if let Some(o) = r.conns.get(conn) {
                     o.write(|w| session::count_msg(w, sub, *n));
@@ -867,6 +912,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
         let mut r = st.borrow_mut();
         r.subs.remove_conn(conn);
         r.held.release_conn(conn);
+        r.negs.release_conn(conn);
         r.conns.remove(&conn);
         if let Some(h) = out.look(heavy::now_ms(), micros(r.looked.elapsed()), true) {
             metrics::inc(&shared.metrics.of(r.idx).bursts);
@@ -1054,6 +1100,7 @@ fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out
         pending: &r.pending,
         offload: &offload,
         held: &mut r.held,
+        negs: &mut r.negs,
         conn,
         talk: &out.talk,
         ip: out.ip,

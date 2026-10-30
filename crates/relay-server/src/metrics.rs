@@ -105,8 +105,10 @@ counters! {
     counts_offloaded,
     /// REQs costly enough to be answered by the query workers.
     reqs_offloaded,
-    /// Costly REQs and COUNTs answered on a reactor because the workers'
-    /// queue was full (a burst of them: slower, but not refused).
+    /// NEG-OPENs whose set was large enough to be built by the query workers.
+    negs_offloaded,
+    /// Costly REQs, COUNTs and NEG-OPENs answered on a reactor because the
+    /// workers' queue was full (a burst of them: slower, but not refused).
     reqs_inline_fallback,
     /// NEG-OPEN messages.
     neg_opens,
