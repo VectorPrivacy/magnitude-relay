@@ -22,6 +22,11 @@ It's built around what Vector actually sends: gift-wrapped DMs, Concord Communit
 
 <p align="center"><sub>Against strfry, same machine, same cores, every answer checked. Full results in <a href="docs/BENCHMARKS.md">docs/BENCHMARKS.md</a>.</sub></p>
 
+<p align="center">
+  <img src="docs/assets/benchmark-11192026.png" alt="Overall speed score on one machine: Magnitude 100, Ditto 54, fastr 17, strfry 13, Nostella 12" width="600">
+  <p align="center"><sub>Five relays, same machine, same two cores. Benchmarked 19 November 2026.</sub></p>
+</p>
+
 ## Why Magnitude Relay
 
 **Fast where it counts.** On 951 requests built from 4.9 million real Vector events, it answered in 0.45 ms on average against strfry's 17.4 ms. DM inboxes and Community channels open up to 10× faster, NIP-77 sync runs up to 6.7× faster, and a new message reaches a 1,000-member Community in 0.58 ms instead of 41.9 ms.
